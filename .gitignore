@@ -1,0 +1,17 @@
+# Secrets - never commit real credentials. Streamlit Cloud has its own Secrets manager in the
+# app dashboard; only the .example template below should ever be in the repo.
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated map output (test PDFs etc.) - not part of the app itself
+epm_test/
+*.pdf
+!EPM25210_example_output.pdf
+
+# OS/editor cruft
+.DS_Store
