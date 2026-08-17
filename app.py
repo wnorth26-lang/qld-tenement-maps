@@ -27,6 +27,7 @@ from datetime import datetime
 import streamlit as st
 
 import epm_locality_map as m
+from map_design_rules import design_profile
 from report_map_catalog import JURISDICTIONS, REPORT_TYPES, SOURCES, map_products
 
 st.set_page_config(page_title="Agent Evidence Map Studio", layout="wide")
@@ -113,7 +114,13 @@ with st.sidebar:
     st.header("3. Map product")
     product_label = st.selectbox("Map needed", list(product_by_label))
     selected_product = product_by_label[product_label]
+    selected_design = design_profile(selected_product["id"], jurisdiction)
     st.caption(selected_product["purpose"])
+    low_scale, high_scale = selected_design["recommended_scale_range"]
+    st.caption(
+        f"Design profile: {selected_design['page_size']} {selected_design['orientation']} · "
+        f"1:{low_scale:,}–1:{high_scale:,} · {selected_design['output_dpi']} dpi"
+    )
     st.link_button("Open current regulator guidance", SOURCES[jurisdiction])
     if selected_product["render_status"] == "available":
         st.success("Available in the current QLD renderer")
@@ -159,6 +166,17 @@ st.write("Suggested map set for this report:")
 for row in products:
     marker = "Ready" if row["render_status"] == "available" else "State adapter required"
     st.write(f"- **{row['label']}** — {row['purpose']}  `{marker}`")
+
+with st.expander("Ideal GIS layout and quality controls", expanded=True):
+    st.write(selected_design["selection_rule"])
+    st.write(
+        f"Recommended output: **{selected_design['page_size']} "
+        f"{selected_design['orientation']}**, **300 dpi**, minimum body text "
+        f"**{selected_design['minimum_text_pt']} pt**, with **12% extent padding**."
+    )
+    st.write("Required map furniture:")
+    for element in selected_design["mandatory_elements"]:
+        st.write(f"- {element}")
 
 if jurisdiction != "QLD":
     st.info("The requirements catalogue is available for this jurisdiction, but map generation remains disabled until its official tenure and layer adapters are implemented and tested.")
