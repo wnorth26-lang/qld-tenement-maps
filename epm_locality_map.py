@@ -25,6 +25,7 @@ Requires: requests, geopandas, shapely, matplotlib, pyproj
 """
 
 import argparse
+import contextvars
 import io
 import math
 import re
@@ -32,6 +33,8 @@ import textwrap
 from datetime import datetime
 
 import geopandas as gpd
+import matplotlib
+matplotlib.use("Agg")  # deterministic, headless renderer for CLI/Streamlit/worker processes
 import matplotlib.patheffects as pe
 import matplotlib.pyplot as plt
 import numpy as np
@@ -86,6 +89,29 @@ MGA_ZONES = {
     56: "EPSG:7856",
 }
 
+_RENDER_DIAGNOSTICS = contextvars.ContextVar("render_diagnostics", default=None)
+
+
+def start_render_diagnostics():
+    """Start request-local source diagnostics; returns (list, reset token)."""
+    diagnostics = []
+    return diagnostics, _RENDER_DIAGNOSTICS.set(diagnostics)
+
+
+def finish_render_diagnostics(token):
+    _RENDER_DIAGNOSTICS.reset(token)
+
+
+def _record_diagnostic(dataset_id, result_state, feature_count=None, error=None):
+    diagnostics = _RENDER_DIAGNOSTICS.get()
+    if diagnostics is not None:
+        row = {"dataset_id": dataset_id, "result_state": result_state}
+        if feature_count is not None:
+            row["feature_count"] = feature_count
+        if error is not None:
+            row["error"] = type(error).__name__
+        diagnostics.append(row)
+
 
 def normalise_epm(epm_input: str) -> str:
     """Turn '25210', 'EPM25210', 'epm 25210' into the service's 'EPM 25210' format."""
@@ -137,7 +163,7 @@ def esri_paths_to_geometry(paths):
     return lines[0] if len(lines) == 1 else MultiLineString(lines)
 
 
-def _fetch_lines(url, params, empty_cols):
+def _fetch_lines(url, params, empty_cols, dataset_id="context_lines"):
     """Shared helper for the optional context layers (roads, watercourses): never raises -
     a failed fetch just means that layer is left off the map."""
     params = dict(params)
@@ -155,10 +181,13 @@ def _fetch_lines(url, params, empty_cols):
             rec["geometry"] = geom
             records.append(rec)
         if not records:
+            _record_diagnostic(dataset_id, "verified_zero", 0)
             return gpd.GeoDataFrame(columns=empty_cols + ["geometry"], geometry="geometry", crs=crs)
+        _record_diagnostic(dataset_id, "matches", len(records))
         return gpd.GeoDataFrame(records, geometry="geometry", crs=crs)
     except Exception as exc:  # noqa: BLE001 - these are optional decoration layers
         print(f"Warning: could not fetch context layer ({exc}).")
+        _record_diagnostic(dataset_id, "source_failure", error=exc)
         return gpd.GeoDataFrame(columns=empty_cols + ["geometry"], geometry="geometry", crs=crs)
 
 
@@ -178,7 +207,7 @@ def fetch_roads(gdf_proj: gpd.GeoDataFrame, target_crs: str, state_controlled_on
         "f": "json",
         "_crs": target_crs,
     }
-    gdf = _fetch_lines(f"{ROADS_BASE}/{ROADS_LAYER}/query", params, ["road_name", "road_type"])
+    gdf = _fetch_lines(f"{ROADS_BASE}/{ROADS_LAYER}/query", params, ["road_name", "road_type"], "qld_roads")
     return gdf
 
 
@@ -197,7 +226,7 @@ def fetch_watercourses(gdf_proj: gpd.GeoDataFrame, target_crs: str, min_order: i
         "f": "json",
         "_crs": target_crs,
     }
-    gdf = _fetch_lines(f"{WATER_BASE}/{WATERCOURSE_ORDER_LAYER}/query", params, ["name", "stream_order"])
+    gdf = _fetch_lines(f"{WATER_BASE}/{WATERCOURSE_ORDER_LAYER}/query", params, ["name", "stream_order"], "qld_watercourses")
     return gdf
 
 
@@ -542,6 +571,7 @@ def fetch_generic_layer(key: str, minx: float, miny: float, maxx: float, maxy: f
     empty = gpd.GeoDataFrame(columns=["geometry"], geometry="geometry", crs=target_crs)
     if entry is None:
         print(f"Warning: unknown extra layer '{key}' - skipped.")
+        _record_diagnostic(key, "source_failure", error=KeyError(key))
         return empty
 
     pad = max(maxx - minx, maxy - miny) * pad_frac
@@ -570,6 +600,7 @@ def fetch_generic_layer(key: str, minx: float, miny: float, maxx: float, maxy: f
             # out_fields name) rather than an HTTP error status, so this needs its own check -
             # otherwise it silently looks like "no features found" instead of a real problem.
             print(f"Warning: extra layer '{key}' query failed - {data['error']}.")
+            _record_diagnostic(key, "source_failure", error=RuntimeError("ArcGIS service error"))
             return empty
         records = []
         for feat in data.get("features", []):
@@ -586,10 +617,13 @@ def fetch_generic_layer(key: str, minx: float, miny: float, maxx: float, maxy: f
             rec["geometry"] = geom
             records.append(rec)
         if not records:
+            _record_diagnostic(key, "verified_zero", 0)
             return empty
+        _record_diagnostic(key, "matches", len(records))
         return gpd.GeoDataFrame(records, geometry="geometry", crs=target_crs)
     except Exception as exc:  # noqa: BLE001 - optional decoration layer, never fatal
         print(f"Warning: could not fetch extra layer '{key}' ({exc}).")
+        _record_diagnostic(key, "source_failure", error=exc)
         return empty
 
 
@@ -791,6 +825,8 @@ def fetch_epm_gdf(epm_number: str) -> gpd.GeoDataFrame:
         resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
+        if data.get("error"):
+            raise RuntimeError("Queensland permit service returned an error")
         feats = data.get("features", [])
         if feats:
             feat = feats[0]
@@ -934,6 +970,7 @@ def fetch_basemap_image(minx, miny, maxx, maxy, target_crs: str, width_px=2000, 
         return np.array(img.convert("RGB"))
     except Exception as exc:  # noqa: BLE001 - imagery is optional, never fail the map for it
         print(f"Warning: could not fetch satellite imagery ({exc}). Continuing without it.")
+        _record_diagnostic("esri_world_imagery", "source_failure", error=exc)
         return None
 
 
@@ -951,9 +988,11 @@ def fetch_greyscale_basemap(minx, miny, maxx, maxy, target_crs: str, width_px=20
             base.alpha_composite(ref)
         except Exception as exc:  # noqa: BLE001 - labels are a nice-to-have on top of the base
             print(f"Warning: could not fetch grey basemap labels ({exc}). Using unlabelled base.")
+            _record_diagnostic("esri_light_gray_reference", "source_failure", error=exc)
         return np.array(base.convert("RGB"))
     except Exception as exc:  # noqa: BLE001 - imagery is optional, never fail the map for it
         print(f"Warning: could not fetch grey basemap ({exc}). Continuing without it.")
+        _record_diagnostic("esri_light_gray_base", "source_failure", error=exc)
         return None
 
 
@@ -1405,10 +1444,10 @@ def setup_map_frame(gdf_proj: gpd.GeoDataFrame, target_crs: str, forced_scale: i
     return fig, ax, xlim, ylim, scale, has_imagery, text_color, halo
 
 
-def add_title_block(fig, lines, author, scale, zone, target_crs, extra_source=None):
+def add_title_block(fig, lines, author, scale, zone, target_crs, extra_source=None, map_date=None):
     """Standard title block: first line bold/large, rest as body text, then a footer row of
     scale/CRS/author/date/source."""
-    today = datetime.now().strftime("%d %B %Y")
+    today = (map_date or datetime.now()).strftime("%d %B %Y")
     fig.text(0.06, 0.16, lines[0], fontsize=16, fontweight="bold")
     y = 0.125
     for line in lines[1:]:
@@ -1439,7 +1478,7 @@ def _mpl_legend_handle(kind, color):
 
 
 def build_map(gdf: gpd.GeoDataFrame, author: str, forced_scale: int = None, basemap: str = "satellite",
-              extra_layers=None):
+              extra_layers=None, map_date=None):
     row = gdf.iloc[0]
     attrs = {k: row[k] for k in gdf.columns if k != "geometry"}
 
@@ -1522,7 +1561,7 @@ def build_map(gdf: gpd.GeoDataFrame, author: str, forced_scale: int = None, base
             f"Holder: {holder}    |    Status: {status}    |    Mineral(s): {minerals}",
             f"Area: {area_ha:,.0f} ha (recalculated from boundary)" + (f"    |    {nearby_line}" if nearby_line else ""),
         ],
-        author, scale, zone, target_crs, extra_source,
+        author, scale, zone, target_crs, extra_source, map_date,
     )
 
     return fig, scale, zone, target_crs, legend_fig
@@ -1642,7 +1681,7 @@ def build_subblock_maps(gdf: gpd.GeoDataFrame, author: str, relinquish_codes=Non
                          forced_scale: int = None, project_name: str = None,
                          drawn_by: str = None, report_title: str = None,
                          page_number=None, company_name: str = None, context_layers: bool = True,
-                         basemap: str = "none", extra_layers=None):
+                         basemap: str = "none", extra_layers=None, map_date=None):
     """Build a single report-style sub-block map, matching a typical consultant partial-
     relinquishment report figure: sub-blocks as thin gold-outlined cells labelled by letter,
     roads/watercourses as light reference context, a bordered title-block table and legend
@@ -1875,7 +1914,8 @@ def build_subblock_maps(gdf: gpd.GeoDataFrame, author: str, relinquish_codes=Non
 
     project_name = project_name or short_name
     drawn_by = drawn_by or "".join(w[0] for w in author.split()[:2]).upper()
-    date_str = datetime.now().strftime("%d/%m/%Y")
+    effective_date = map_date or datetime.now()
+    date_str = effective_date.strftime("%d/%m/%Y")
 
     if resolved_codes:
         title_lines = ["Sub-block Relinquishment", f"{permit_no} {permit_name}".strip()]
@@ -1901,7 +1941,7 @@ def build_subblock_maps(gdf: gpd.GeoDataFrame, author: str, relinquish_codes=Non
         draw_report_legend_box(fig, (0.08, 0.13, 0.32, 0.17), legend_entries)
 
     footer_left = f"{permit_no} {permit_name}".strip()
-    footer_right = report_title or f"Partial Relinquishment Report {datetime.now().year}"
+    footer_right = report_title or f"Partial Relinquishment Report {effective_date.year}"
     add_figure_caption_and_footer(fig, caption, footer_left, page_number, footer_right)
 
     return {"map": fig, "legend": legend_fig}, subblocks, zone
