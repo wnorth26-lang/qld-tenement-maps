@@ -138,4 +138,3 @@ def map_products(jurisdiction: str, report_type: str) -> list[dict]:
         )
         output.append(product)
     return output
-
