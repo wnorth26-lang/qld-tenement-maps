@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-app.py - Streamlit prototype for a self-serve QLD tenement map generator.
+app.py - Streamlit prototype for a self-serve Australian report map studio.
 
 Wraps epm_locality_map.py (the locality-map / sub-block-report engine) in a
 simple web form: pick a preset/house style, pick a map type, type in an EPM
@@ -27,8 +27,10 @@ from datetime import datetime
 import streamlit as st
 
 import epm_locality_map as m
+from map_design_rules import design_profile
+from report_map_catalog import JURISDICTIONS, REPORT_TYPES, SOURCES, map_products
 
-st.set_page_config(page_title="QLD Tenement Map Generator", layout="wide")
+st.set_page_config(page_title="Agent Evidence Map Studio", layout="wide")
 
 # ---------------------------------------------------------------------------
 # Presets: in a real product these would be saved per-client (their logo,
@@ -55,13 +57,6 @@ PRESETS = {
         "report_title_template": "Partial Relinquishment Report {year}",
     },
 }
-
-MAP_TYPES = [
-    "Locality map (APO / permit application)",
-    "Sub-block plan (annual report)",
-    "Partial relinquishment report",
-]
-
 
 def try_send_email(to_addr, subject, body, attachments):
     """attachments: list of (filename, bytes, maintype, subtype).
@@ -102,19 +97,44 @@ def try_send_email(to_addr, subject, body, attachments):
         return False, f"Email send failed: {e}"
 
 
-st.title("QLD Tenement Map Generator")
-st.caption("Prototype - wraps the EPM locality-map / sub-block-report script in a self-serve form.")
+st.title("Agent Evidence Map Studio")
+st.caption("Choose the jurisdiction and reporting purpose first. The studio then shows the map set supported by current regulator guidance.")
 
 with st.sidebar:
-    st.header("1. Preset / house style")
+    st.header("1. Jurisdiction")
+    jurisdiction = st.selectbox("State or territory", list(JURISDICTIONS),
+                                format_func=lambda key: JURISDICTIONS[key])
+
+    st.header("2. Report or workflow")
+    report_type = st.selectbox("What are you preparing?", list(REPORT_TYPES),
+                               format_func=lambda key: REPORT_TYPES[key])
+    products = map_products(jurisdiction, report_type)
+    product_by_label = {row["label"]: row for row in products}
+
+    st.header("3. Map product")
+    product_label = st.selectbox("Map needed", list(product_by_label))
+    selected_product = product_by_label[product_label]
+    selected_design = design_profile(selected_product["id"], jurisdiction)
+    st.caption(selected_product["purpose"])
+    low_scale, high_scale = selected_design["recommended_scale_range"]
+    st.caption(
+        f"Design profile: {selected_design['page_size']} {selected_design['orientation']} · "
+        f"1:{low_scale:,}–1:{high_scale:,} · {selected_design['output_dpi']} dpi"
+    )
+    st.link_button("Open current regulator guidance", SOURCES[jurisdiction])
+    if selected_product["render_status"] == "available":
+        st.success("Available in the current QLD renderer")
+    else:
+        st.warning("Research-backed requirement; this state/layer adapter is not yet connected")
+
+    st.header("4. Preset / house style")
     preset_name = st.selectbox("Preset", list(PRESETS.keys()))
     preset = PRESETS[preset_name]
 
-    st.header("2. Map type")
-    map_type = st.selectbox("What do you need?", MAP_TYPES)
+    engine_mode = selected_product.get("engine_mode")
 
-    st.header("3. Basemap")
-    if map_type == MAP_TYPES[0]:
+    st.header("5. Basemap")
+    if engine_mode == "locality":
         basemap = st.selectbox("Background", ["satellite", "none"])
     else:
         basemap_choice = st.selectbox(
@@ -128,7 +148,7 @@ with st.sidebar:
             "None": "none",
         }[basemap_choice]
 
-    st.header("4. Extra context layers")
+    st.header("6. Extra context layers")
     st.caption(
         "Pulled live from the same public QLD spatial-gis services GeoResGlobe itself runs "
         "on. This is a curated subset, not literally every layer GeoResGlobe has - most of "
@@ -140,6 +160,26 @@ with st.sidebar:
     extra_layer_labels = {v["label"]: k for k, v in m.LAYER_CATALOG.items()}
     selected_labels = st.multiselect("Layers to add to the map", list(extra_layer_labels.keys()))
     extra_layers = [extra_layer_labels[lbl] for lbl in selected_labels]
+
+st.subheader(f"{JURISDICTIONS[jurisdiction]} · {REPORT_TYPES[report_type]}")
+st.write("Suggested map set for this report:")
+for row in products:
+    marker = "Ready" if row["render_status"] == "available" else "State adapter required"
+    st.write(f"- **{row['label']}** — {row['purpose']}  `{marker}`")
+
+with st.expander("Ideal GIS layout and quality controls", expanded=True):
+    st.write(selected_design["selection_rule"])
+    st.write(
+        f"Recommended output: **{selected_design['page_size']} "
+        f"{selected_design['orientation']}**, **300 dpi**, minimum body text "
+        f"**{selected_design['minimum_text_pt']} pt**, with **12% extent padding**."
+    )
+    st.write("Required map furniture:")
+    for element in selected_design["mandatory_elements"]:
+        st.write(f"- {element}")
+
+if jurisdiction != "QLD":
+    st.info("The requirements catalogue is available for this jurisdiction, but map generation remains disabled until its official tenure and layer adapters are implemented and tested.")
 
 st.header("Tenement")
 source = st.radio(
@@ -169,7 +209,7 @@ with col2:
     forced_scale = st.text_input("Force scale denominator (optional, e.g. 100000)")
 
 relinquish_codes, report_title = [], None
-if map_type == MAP_TYPES[2]:
+if engine_mode == "partial_relinquishment":
     relinquish_raw = st.text_input(
         "Sub-block codes being relinquished (comma-separated)",
         placeholder="e.g. 291J,291O,291T,291Y",
@@ -177,13 +217,14 @@ if map_type == MAP_TYPES[2]:
     relinquish_codes = [c.strip() for c in relinquish_raw.split(",") if c.strip()]
     default_title = preset["report_title_template"].format(year=datetime.now().year)
     report_title = st.text_input("Report title", value=default_title)
-elif map_type == MAP_TYPES[1]:
+elif engine_mode == "annual_subblock":
     default_title = "Annual Report {year}".format(year=datetime.now().year)
     report_title = st.text_input("Report title", value=default_title)
 
 st.divider()
 email_to = st.text_input("Email address to send the finished map(s) to (optional)")
-generate = st.button("Generate map", type="primary")
+generate = st.button("Generate selected map", type="primary",
+                     disabled=selected_product["render_status"] != "available")
 
 if generate:
     st.session_state.pop("results", None)
@@ -207,7 +248,7 @@ if generate:
             scale_val = int(forced_scale) if forced_scale.strip() else None
             results = []  # list of (label, fig)
 
-            if map_type == MAP_TYPES[0]:
+            if engine_mode == "locality":
                 fig, scale, zone, crs, legend_fig = m.build_map(gdf, author, scale_val, basemap,
                                                                   extra_layers=extra_layers)
                 results.append(("Locality map", fig))
@@ -269,7 +310,7 @@ if "results" in st.session_state:
         if st.button("Send email now"):
             ok, message = try_send_email(
                 email_to,
-                subject=f"Your tenement map(s) - {map_type}",
+                subject=f"Your tenement map(s) - {REPORT_TYPES[report_type]}",
                 body="Attached are the maps you generated. Automatically produced - please "
                      "verify boundary/sub-block details against the source tenement record "
                      "before lodging.",

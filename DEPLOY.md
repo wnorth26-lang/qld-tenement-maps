@@ -5,7 +5,9 @@ only exists on your machine while the command is running, which is why the link 
 on a different computer the next day. Streamlit Community Cloud runs the app on Streamlit's own
 servers instead, so it gets one link that's always up.
 
-It's free for this kind of app.
+It's free for this kind of prototype app. It is not the recommended commercial
+production host; see `AEL_MAP_STUDIO.md` for the account, queue, storage,
+payments, privacy, reliability and licensing work still required.
 
 ## 1. Put the code on GitHub
 

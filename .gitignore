@@ -10,6 +10,7 @@ venv/
 
 # Generated map output (test PDFs etc.) - not part of the app itself
 epm_test/
+test-output/
 *.pdf
 !EPM25210_example_output.pdf
 
